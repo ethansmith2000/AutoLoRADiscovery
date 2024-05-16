@@ -88,7 +88,7 @@ class Encoder(torch.nn.Module):
 
 
 class Decoder(torch.nn.Module):
-    def __init__(self, data_dim=1_365_504, model_dim=256, out_proj_chunks=1, ff_mult=3, act=torch.nn.SiLU, num_layers=6):
+    def __init__(self, data_dim=1_365_504, model_dim=256, ff_mult=3, out_proj_chunks=1, act=torch.nn.SiLU, num_layers=6):
         super().__init__()
         self.in_proj = nn.Linear(model_dim, model_dim)
         self.resnets = nn.ModuleList([Resnet(model_dim, model_dim * ff_mult, act=act) for _ in range(num_layers)])
@@ -100,3 +100,18 @@ class Decoder(torch.nn.Module):
             x = resnet(x)
         x = self.out_proj(x)
         return x
+
+
+class LoraVAE(torch.nn.Module):
+
+    def __init__(self, data_dim=1_365_504, model_dim=256, ff_mult=3, chunks=1, act=torch.nn.SiLU, encoder_layers=6, decoder_layers=12, latent_dim=None):
+        super().__init__()
+        self.encoder = Encoder(data_dim, model_dim, ff_mult, chunks, act, encoder_layers, latent_dim)
+        self.decoder = Decoder(data_dim, model_dim, ff_mult, chunks, act, decoder_layers)
+
+    def forward(self, x):
+        mean, logvar = self.encoder(x)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mean + eps * std
+        return self.decoder(z), mean, logvar

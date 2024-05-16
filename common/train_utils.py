@@ -15,8 +15,9 @@ from diffusers.utils.torch_utils import is_compiled_module
 import wandb
 import logging
 import math
-import loras
-from loras import patch_lora
+# import common.loras as loras
+# from loras import patch_lora
+from common.loras import patch_lora
 import random
 from diffusers import DPMSolverMultistepScheduler
 from diffusers.optimization import get_scheduler
@@ -31,6 +32,7 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
+
 
 def collate_fn(examples):
     input_ids = [example["instance_prompt_ids"] for example in examples]
@@ -258,6 +260,89 @@ def init_train_basics(args, logger):
     return accelerator, weight_dtype
 
 
+def load_models(args, accelerator, weight_dtype):
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+        use_fast=False,
+    )
+
+    # Load scheduler and models
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    text_encoder = transformers.CLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
+
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+        if args.train_text_encoder:
+            text_encoder.gradient_checkpointing_enable()
+
+    return tokenizer, noise_scheduler, text_encoder, vae, unet
+
+
+def get_optimizer(args, params_to_optimize, accelerator):
+    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
+    optimizer_class = torch.optim.AdamW
+    if args.use_8bit_adam:
+        import bitsandbytes as bnb
+        optimizer_class = bnb.optim.AdamW8bit
+
+    optimizer = optimizer_class(
+        params_to_optimize,
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+    )
+
+    return optimizer, lr_scheduler
+
+
+def get_dataset(args, tokenizer):
+
+    # Dataset and DataLoaders creation:
+    train_dataset = MyDataset(
+        instance_data_root=args.instance_data_dir,
+        instance_prompt=args.instance_prompt,
+        tokenizer=tokenizer,
+        size=args.resolution,
+        center_crop=args.center_crop,
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=args.dataloader_num_workers,
+    )
+
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+
+    return train_dataset, train_dataloader, num_update_steps_per_epoch
+
+
 default_arguments = dict(
     pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
     revision="main",
@@ -325,88 +410,3 @@ default_arguments = dict(
     ],
     train_text_encoder=True,
 )
-
-
-
-def load_models(args, accelerator, weight_dtype):
-    # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=args.revision,
-        use_fast=False,
-    )
-
-    # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder = transformers.CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
-
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
-
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
-        if args.train_text_encoder:
-            text_encoder.gradient_checkpointing_enable()
-
-    return tokenizer, noise_scheduler, text_encoder, vae, unet
-
-
-
-
-def get_train_stuff(args, params_to_optimize, tokenizer, accelerator):
-    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    optimizer_class = torch.optim.AdamW
-    if args.use_8bit_adam:
-        import bitsandbytes as bnb
-        optimizer_class = bnb.optim.AdamW8bit
-
-    optimizer = optimizer_class(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
-
-    # Dataset and DataLoaders creation:
-    train_dataset = MyDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=args.dataloader_num_workers,
-    )
-
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
-        num_cycles=args.lr_num_cycles,
-        power=args.lr_power,
-    )
-
-    return optimizer, train_dataset, train_dataloader, lr_scheduler, num_update_steps_per_epoch
-
-
-
-    

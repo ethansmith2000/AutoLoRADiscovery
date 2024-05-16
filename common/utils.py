@@ -54,6 +54,21 @@ def aggregate_loras(path, rank):
     return all_state_dicts
 
 
+# def aggregate_loras(path, rank):
+#     files = glob.glob(f"{path}/**/lora_layers.pth", recursive=True)
+#     for f in tqdm(files):
+#         # basically runs svd on it, this ensures down/up weights are balanced
+#         state_dict = torch.load(f, map_location="cuda")
+#         new_state_dict = {}
+#         new_state_dict["state_dict"] = {}
+#         new_state_dict["state_dict"].update(state_dict['unet'])
+#         new_state_dict["state_dict"].update(state_dict['text_encoder'])
+#         new_state_dict['num_params'] = state_dict['num_params']
+#         new_state_dict['lora_layers'] = state_dict['lora_layers']
+#         new_state_dict['lora_layers_te'] = state_dict['lora_layers_te']
+#         new_state_dict = change_lora_rank(new_state_dict, rank=rank)
+#         torch.save(new_state_dict, f.replace("lora_layers","lora_layers_new"))
+
     
 def make_weight_vector(state_dict):
     # ensure same ordering
@@ -63,11 +78,12 @@ def make_weight_vector(state_dict):
     idx = 0
     for k in keys:
         weight = state_dict[k]
-        flattened = weight.flatten()
-        interval = (idx, idx + len(flattened))
-        idx = idx + len(flattened)
-        weight_dict[k] = interval
-        weights.append(flattened)
+        if isinstance(weight, torch.Tensor):
+            flattened = weight.flatten()
+            interval = (idx, idx + len(flattened))
+            idx = idx + len(flattened)
+            weight_dict[k] = interval
+            weights.append(flattened)
     
     return torch.cat(weights), weight_dict
 

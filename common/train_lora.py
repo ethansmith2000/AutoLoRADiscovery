@@ -35,7 +35,8 @@ from train_utils import (
     MyDataset,
     default_arguments,
     load_models,
-    get_train_stuff
+    get_optimizer,
+    get_dataset,
 )
 from types import SimpleNamespace
 
@@ -67,7 +68,8 @@ def train(args):
     print("Number of parameters in LoRA layers: ", num_params)
     print("Training LoRA layers: ", names_to_optimize)
 
-    optimizer, train_dataset, train_dataloader, lr_scheduler, num_update_steps_per_epoch = get_train_stuff(args, params_to_optimize, tokenizer, accelerator)
+    optimizer, lr_scheduler = get_optimizer(args, params_to_optimize, accelerator)
+    train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args, tokenizer)
 
     # Prepare everything with our `accelerator`.
     unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -153,7 +155,7 @@ def train(args):
                     grad_norm = accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

@@ -21,25 +21,42 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from accelerate.logging import get_logger
 from tqdm.auto import tqdm
+from types import SimpleNamespace
 
-import loras
-from loras import patch_lora
+import sys
+sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
 
-import common.train_utils as train_utils
-from train_utils import (
+# from common import utils
+# from common import loras
+# from common import train_utils
+
+# from utils import convert_to_multi
+# from loras import patch_lora
+# from train_utils import (
+#     collate_fn,
+#     init_train_basics,
+#     log_validation,
+#     unwrap_model,
+#     MyDataset,
+#     load_models,
+#     get_train_stuff,
+#     save_model,
+# )
+
+from common.utils import convert_to_multi
+from common.loras import patch_lora
+from common.train_utils import (
     collate_fn,
     init_train_basics,
     log_validation,
     unwrap_model,
     MyDataset,
     load_models,
-    get_train_stuff,
+    get_optimizer,
+    get_dataset,
     save_model,
 )
-from types import SimpleNamespace
 
-import common.utils as utils
-from utils import convert_to_multi
 
 
 default_arguments = dict(
@@ -50,7 +67,7 @@ default_arguments = dict(
     instance_data_dir="/home/ubuntu/AutoLoRADiscovery/people/Jeff Bezos",
     num_validation_images=4,
     num_class_images=100,
-    output_dir="lora-dreambooth-model",
+    output_dir="PCLora",
     seed=None,
     resolution=640,
     center_crop=False,
@@ -106,7 +123,7 @@ default_arguments = dict(
         "11"
     ],
     train_text_encoder=True,
-    bundle_lora_path="",
+    bundle_lora_path="/home/ubuntu/AutoLoRADiscovery/lora_bundle.pt",
 )
 
 
@@ -130,13 +147,16 @@ def train(args):
     if args.train_text_encoder:
         patch_lora(text_encoder, rank=args.lora_rank, included_terms=args.lora_layers_te, num_loras=num_loras)
 
-    bundle_lora = [convert_to_multi(lora, i) for i, lora in enumerate(bundle_lora)]
-    bundle_dict = {}
-    for lora in bundle_lora:
-        bundle_dict.update(lora)
-
-    text_encoder.load_state_dict(bundle_dict, strict=False)
-    unet.load_state_dict(bundle_dict, strict=False)
+    if isinstance(bundle_lora, list):
+        bundle_lora = [convert_to_multi(lora, i) for i, lora in enumerate(bundle_lora)]
+        bundle_dict = {}
+        for lora in bundle_lora:
+            bundle_dict.update(lora)
+    
+    # save it
+    torch.save(bundle_lora, args.bundle_lora_path)
+    missing, unexpected = text_encoder.load_state_dict(bundle_dict, strict=False)
+    missing, unexpected = unet.load_state_dict(bundle_dict, strict=False)
 
     # Optimizer creation
     params_to_optimize = [p for n,p in unet.named_parameters() if "each_scale" in n]
@@ -150,7 +170,8 @@ def train(args):
     print("Number of parameters training: ", num_params)
     print("Training following weights: ", names_to_optimize)
 
-    optimizer, train_dataset, train_dataloader, lr_scheduler, num_update_steps_per_epoch = get_train_stuff(args, params_to_optimize, tokenizer, accelerator)
+    optimizer, lr_scheduler = get_optimizer(args, params_to_optimize, accelerator)
+    train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args, tokenizer)
 
     # Prepare everything with our `accelerator`.
     unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -236,7 +257,7 @@ def train(args):
                     grad_norm = accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

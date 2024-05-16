@@ -87,18 +87,19 @@ class LoraLayerNorm(nn.Module):
         self.lora_weight = nn.ParameterList([torch.nn.Parameter(torch.zeros(normalized_shape)) for _ in range(num_loras)])
         self.lora_bias = nn.ParameterList([torch.nn.Parameter(torch.zeros(normalized_shape)) for _ in range(num_loras)])
         
-        self.each_scale_weight = nn.ParameterList([torch.nn.Parameter(torch.ones(1)) for _ in range(num_loras)])
-        self.each_scale_bias = nn.ParameterList([torch.nn.Parameter(torch.ones(1)) for _ in range(num_loras)])
+        self.each_scale_weight = nn.Parameter(torch.ones(num_loras))
+        # self.each_scale_bias = nn.Parameter(torch.ones(num_loras))
 
         self.normalize = torch.nn.functional.softmax if num_loras > 1 else lambda x, dim: x
 
     def get_weight_bias(self):
-        weight, bias, scale_weight, scale_bias = map(lambda x: torch.stack(list(x)), [self.lora_weight, self.lora_bias, self.each_scale_weight, self.each_scale_bias])
+        weight, bias = map(lambda x: torch.stack(list(x)), [self.lora_weight, self.lora_bias])
 
-        scale_weight = self.normalize(scale_weight, dim=0)
-        scale_bias = self.normalize(scale_bias, dim=0)
-        weight = (weight * scale_weight).sum(dim=0)
-        bias = (bias * scale_bias).sum(dim=0)
+        scale_weight = self.normalize(self.each_scale_weight, dim=0)
+        # scale_bias = self.normalize(self.each_scale_bias, dim=0)
+        weight = (weight * scale_weight[:,None]).sum(dim=0)
+        # bias = (bias * scale_bias[:,None]).sum(dim=0)
+        bias = (bias * scale_weight[:,None]).sum(dim=0)
 
         weight = self.weight + weight
         bias = self.bias + bias
@@ -121,10 +122,10 @@ class LoraConv2d(torch.nn.Module):
     def __init__(self, base_layer, rank=32, num_loras=1):
         super(LoraConv2d, self).__init__()
         self.base_layer = base_layer
-        self.lora_down = nn.ParameterList([nn.Parameter(torch.randn(self.base_layer.in_channels, rank, self.base_layer.kernel_size[0], self.base_layer.kernel_size[1]) / rank) for _ in range(num_loras)])
-        self.lora_up = nn.ParameterList([nn.Parameter(torch.zeros(rank, self.base_layer.out_channels, 1, 1)) for _ in range(num_loras)])
-        self.each_scale_down = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(num_loras)])
-        self.each_scale_up = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(num_loras)])
+        self.lora_down = nn.ParameterList([nn.Parameter(torch.randn(rank, self.base_layer.in_channels, self.base_layer.kernel_size[0], self.base_layer.kernel_size[1]) / rank) for _ in range(num_loras)])
+        self.lora_up = nn.ParameterList([nn.Parameter(torch.zeros(self.base_layer.out_channels, rank, 1, 1)) for _ in range(num_loras)])
+        self.each_scale_down = nn.Parameter(torch.ones(num_loras))
+        self.each_scale_up = nn.Parameter(torch.ones(num_loras))
 
         self.normalize = torch.nn.functional.softmax if num_loras > 1 else lambda x, dim: x
     
@@ -137,11 +138,12 @@ class LoraConv2d(torch.nn.Module):
         }
 
     def get_weight(self):
-        down, up, scale_down, scale_up = map(lambda x: torch.stack(list(x)), [self.lora_down, self.lora_up, self.each_scale_down, self.each_scale_up])
-        scale_down = self.normalize(scale_down, dim=0)
-        scale_up = self.normalize(scale_up, dim=0)
-        down = (down * scale_down).sum(dim=0)
-        up = (up * scale_up).sum(dim=0)
+        down, up = map(lambda x: torch.stack(list(x)), [self.lora_down, self.lora_up])
+        scale_down = self.normalize(self.each_scale_down, dim=0)
+        # scale_up = self.normalize(self.each_scale_up, dim=0)
+        down = (down * scale_down[:,None,None]).sum(dim=0)
+        # up = (up * scale_up[:,None,None]).sum(dim=0)
+        up = (up * scale_down[:,None,None]).sum(dim=0)
         return down, up
 
     def forward(self, x):
@@ -154,12 +156,12 @@ class LoraConv2d(torch.nn.Module):
 class LoraLinear(LoraConv2d):
 
     def __init__(self, base_layer, rank=32, num_loras=1):
-        super().__init__(base_layer, rank=32, num_loras=1)
+        nn.Module.__init__(self)
         self.base_layer = base_layer
-        self.lora_down = nn.ParameterList([nn.Parameter(torch.randn(self.base_layer.in_features, rank) / rank) for _ in range(num_loras)])
-        self.lora_up = nn.ParameterList([nn.Parameter(torch.zeros(rank, self.base_layer.out_features)) for _ in range(num_loras)])
-        self.each_scale_down = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(num_loras)])
-        self.each_scale_up = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(num_loras)])
+        self.lora_down = nn.ParameterList([nn.Parameter(torch.randn(rank, self.base_layer.in_features) / rank) for _ in range(num_loras)])
+        self.lora_up = nn.ParameterList([nn.Parameter(torch.zeros(self.base_layer.out_features, rank)) for _ in range(num_loras)])
+        self.each_scale_down = nn.Parameter(torch.ones(num_loras))
+        # self.each_scale_up = nn.Parameter(torch.ones(num_loras))
 
         self.normalize = torch.nn.functional.softmax if num_loras > 1 else lambda x, dim: x
     
@@ -212,6 +214,6 @@ def patch_lora(model, rank=32, included_terms=None, running_name=None, num_loras
         if isinstance(m, nn.Module):
             names = [name for name, layer in m.named_modules() if name != ""]
             if len(names) > 0:
-                patch_lora(m, rank=rank, included_terms=included_terms, running_name=full_name)
+                patch_lora(m, rank=rank, included_terms=included_terms, running_name=full_name, num_loras=num_loras)
 
 

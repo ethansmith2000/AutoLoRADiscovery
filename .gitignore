@@ -3,3 +3,6 @@ wandb*
 *cpython*
 *lora_outputs*
 493366
+lora_bundle.pt
+checkpoint*
+*.pt*

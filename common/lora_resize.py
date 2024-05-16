@@ -102,7 +102,8 @@ def svd(full_mat, lora_up, lora_down, rank, **kwargs):
         pos = diff.argmax()
         max_diff = diff.max().item()
         max_rel_error = (max_diff / full_mat.flatten()[pos].item() + 1e-6) * 100
-        print(f"MAX DIFF: {max_diff:.7f}, MAX REL ERROR: {max_rel_error:.7f}%")
+        if kwargs.get("verbose"):
+            print(f"MAX DIFF: {max_diff:.7f}, MAX REL ERROR: {max_rel_error:.7f}%")
 
     return new_lora_up.cpu(), new_lora_down.cpu()
 
@@ -133,7 +134,8 @@ def change_lora_rank(state_dict,
                      l1_factor=0.0,
                      error_threshold=10,
                      allowed_num_tries=20,
-                     method="auto"  # ["auto", "svd", "optimization", "zero_pad"]
+                     method="auto",  # ["auto", "svd", "optimization", "zero_pad"]
+                     verbose=False,
                      ):
     """
     :param state_dict: a torch state_dict
@@ -173,6 +175,7 @@ def change_lora_rank(state_dict,
         error_threshold=error_threshold,
         equal_norm_penalty=equal_norm_penalty,
         allowed_num_tries=allowed_num_tries,
+        verbose=verbose
     )
 
     for key in tqdm(weights_with_lora):
@@ -186,7 +189,8 @@ def change_lora_rank(state_dict,
                 k = lora_down.shape[-1]
                 lora_down = lora_down.reshape(lora_down.shape[0], -1)
             full_mat = lora_up @ lora_down
-            print(key, full_mat.shape)
+            if verbose:
+                print(key, full_mat.shape)
 
         if method == "optimization":
             new_lora_up, new_lora_down = get_least_squares_solution(full_mat, lora_up, lora_down, **kwargs)
