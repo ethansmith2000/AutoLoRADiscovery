@@ -11,17 +11,18 @@ import sys
 sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
 
 from common.loras import patch_lora
-from common.utils import make_weight_vector
+from common.utils import make_weight_vector, augmentations
 from common.train_utils import (
     init_train_basics,
     log_validation,
     save_model,
     unwrap_model,
-    get_optimizer
+    get_optimizer,
+    more_init
 )
 
 from types import SimpleNamespace
-from discover_lora_diffusion.models import LoraDiffusion
+from discover_lora_diffusion.models import LoraDiffusion, DiT
 from torch.utils.data import Dataset
 import random
 import diffusers
@@ -66,28 +67,71 @@ def get_dataset(args):
 
     return train_dataset, train_dataloader, num_update_steps_per_epoch
 
+def compute_snr(noise_scheduler, timesteps):
+    """
+    Computes SNR as per
+    https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = alphas_cumprod**0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+    # Expand the tensors.
+    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+    alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
+
+    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
+    sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
+
+    # Compute SNR.
+    snr = (alpha / sigma) ** 2
+    return snr
+
+def get_loss(noise_pred, noise, timesteps, noise_scheduler, snr_gamma=None):
+    if snr_gamma is None:
+        loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+        loss = loss.mean(dim=list(range(1, len(loss.shape))))
+    else:
+        snr = compute_snr(noise_scheduler, timesteps)
+        snr = snr + 2e-4
+        base_weight = (
+                torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+        )
+
+        if noise_scheduler.config.prediction_type == "v_prediction":
+            mse_loss_weights = base_weight + 1
+        else:
+            mse_loss_weights = base_weight
+        loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+    
+    return loss.mean()
 
 default_arguments = dict(
     data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle_for_model.pt",
     output_dir="diffusion_lora",
     seed=None,
-    train_batch_size=32,
-    max_train_steps=1250,
+    train_batch_size=40,
+    max_train_steps=30_000,
     # validation_steps=250,
     num_dataloader_repeats=100,
-    checkpointing_steps=500,
+    checkpointing_steps=2000,
     resume_from_checkpoint=None,
     gradient_accumulation_steps=1,
     gradient_checkpointing=False,
-    learning_rate=5.0e-5,
-    lr_scheduler="constant",
+    learning_rate=1.5e-5,
+    lr_scheduler="linear",
     lr_warmup_steps=50,
     lr_num_cycles=1,
     lr_power=1.0,
     dataloader_num_workers=4,
     use_8bit_adam=True,
     adam_beta1=0.9,
-    adam_beta2=0.99,
+    adam_beta2=0.98,
     adam_weight_decay=1e-2,
     adam_epsilon=1e-08,
     max_grad_norm=1.0,
@@ -97,16 +141,8 @@ default_arguments = dict(
     logging_dir="logs",
     local_rank=-1,
     num_processes=1,
-
-    data_dim = 1_365_504,
-    model_dim = 256,
-    ff_mult = 3,
-    chunks = 1,
-    act = torch.nn.SiLU,
-    encoder_layers = 6,
-    decoder_layers = 12,
-
-    kld_weight = 0.1
+    snr_gamma=None,
+    lora_std = 0.0152
 )
 
 
@@ -115,72 +151,48 @@ def train(args):
     args = SimpleNamespace(**args)
     accelerator, weight_dtype = init_train_basics(args, logger)
 
-    lora_diffusion = LoraDiffusion(data_dim=args.data_dim,
-                        model_dim=args.model_dim,
-                        ff_mult=args.ff_mult,
-                        chunks=args.chunks,
-                        act=args.act,
-                        encoder_layers=args.encoder_layers,
-                        decoder_layers=args.decoder_layers
-                        )
+    # lora_diffusion = LoraDiffusion(data_dim=args.data_dim,
+    #                     model_dim=args.model_dim,
+    #                     ff_mult=args.ff_mult,
+    #                     chunks=args.chunks,
+    #                     act=args.act,
+    #                     encoder_layers=args.encoder_layers,
+    #                     decoder_layers=args.decoder_layers
+    #                     )
+
+    lora_diffusion = DiT(
+        total_dim=1_365_504,
+        dim = 1536,
+        num_tokens=889,
+        time_dim = 384,
+        depth=12,
+        num_heads=16,
+        mlp_ratio=4.0,
+    )
+
     scheduler = diffusers.DDIMScheduler.from_config("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
 
     params_to_optimize = list(lora_diffusion.parameters())
     train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args)
     optimizer, lr_scheduler = get_optimizer(args, params_to_optimize, accelerator)
 
+    weight_dict = train_dataset.weight_dict
+
     # Prepare everything with our `accelerator`.
     lora_diffusion, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         lora_diffusion, optimizer, train_dataloader, lr_scheduler
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    global_step, first_epoch, progress_bar = more_init(lora_diffusion, accelerator, args, train_dataloader, 
+                                                        train_dataset, logger, num_update_steps_per_epoch, wandb_name="diffusion_lora")
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        tracker_config = vars(copy.deepcopy(args))
-        accelerator.init_trackers("diffusion_lora", config=tracker_config)
-
-    # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    global_step = 0
-    first_epoch = 0
-
-    # Potentially load in the weights and states from a previous save
-    initial_global_step = 0
-    if args.resume_from_checkpoint:
-        accelerator.print(f"Resuming from checkpoint {args.resume_from_checkpoint}")
-        global_step = int(args.resume_from_checkpoint.split("-")[1])
-
-        initial_global_step = global_step
-        first_epoch = global_step // num_update_steps_per_epoch
-
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
-        initial=initial_global_step,
-        desc="Steps",
-        disable=not accelerator.is_local_main_process,
-    )
 
     for epoch in range(first_epoch, args.num_train_epochs):
         lora_diffusion.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_diffusion):
-                if random.random() < 0.85:
-                    coef = torch.rand(batch.shape[0]).to(batch.device)
-                    batch = coef[:, None] * batch + (1 - coef[:, None]) * batch.flip(0)
+                batch = batch.to(accelerator.device) * (1 / args.lora_std)
+                batch = augmentations(batch, weight_dict)
 
                 noise = torch.randn_like(batch)
                 timesteps = torch.randint(
@@ -190,9 +202,9 @@ def train(args):
                 noisy_model_input = scheduler.add_noise(batch, noise, timesteps)
 
                 pred = lora_diffusion(noisy_model_input, timesteps)
-                mse_loss = F.mse_loss(pred.float(), batch.float(), reduction="mean")
+                loss = get_loss(pred, noise, timesteps, scheduler, snr_gamma=args.snr_gamma)
 
-                accelerator.backward(mse_loss)
+                accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
                 optimizer.step()
@@ -209,7 +221,7 @@ def train(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         torch.save(unwrap_model(accelerator, lora_diffusion).state_dict(), save_path)
 
-            logs = {"mse_loss": mse_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"mse_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -222,8 +234,8 @@ def train(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        save_path = os.path.join(args.output_dir, "lora_vae.pth")
-        torch.save(unwrap_model(accelerator, lora_vae).state_dict(), save_path)
+        save_path = os.path.join(args.output_dir, "lora_diffusion.pth")
+        torch.save(unwrap_model(accelerator, lora_diffusion).state_dict(), save_path)
 
     accelerator.end_training()
 

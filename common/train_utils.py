@@ -32,6 +32,8 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
+import copy
+from tqdm import tqdm
 
 
 def collate_fn(examples):
@@ -395,10 +397,6 @@ default_arguments = dict(
             "attn2.to_k", 
             "attn2.to_v", 
             "attn2.to_out",
-            # "proj_in",
-            # "proj_out",
-            # "norm",
-            #  "ff", 
     ],
     lora_layers_te = [
         "final_layer_norm",
@@ -410,3 +408,57 @@ default_arguments = dict(
     ],
     train_text_encoder=True,
 )
+
+
+def resume_model(model, args, accelerator, num_update_steps_per_epoch):
+    accelerator.print(f"Resuming from checkpoint {args.resume_from_checkpoint}")
+    global_step = int(args.resume_from_checkpoint.split("-")[1])
+    state_dict = torch.load(args.resume_from_checkpoint, map_location="cpu")
+
+    if not isinstance(model, list):
+        model = [model]
+    for m in model:
+        missing, unexpected = m.load_state_dict(state_dict, strict=False)
+
+    initial_global_step = global_step
+    first_epoch = global_step // num_update_steps_per_epoch
+
+    return global_step, initial_global_step, first_epoch
+
+
+def more_init(model, accelerator, args, train_dataloader, train_dataset, logger, num_update_steps_per_epoch, wandb_name="diffusion_lora"):
+    if accelerator.is_main_process:
+        tracker_config = vars(copy.deepcopy(args))
+        accelerator.init_trackers(wandb_name, config=tracker_config)
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # Train!
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
+
+    # Potentially load in the weights and states from a previous save
+    initial_global_step = 0
+    if args.resume_from_checkpoint:
+        global_step, initial_global_step, first_epoch = resume_model(model, args, accelerator, num_update_steps_per_epoch)
+
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        disable=not accelerator.is_local_main_process,
+    )
+
+    return global_step, first_epoch, progress_bar

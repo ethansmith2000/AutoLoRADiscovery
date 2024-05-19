@@ -37,6 +37,7 @@ from train_utils import (
     load_models,
     get_optimizer,
     get_dataset,
+    more_init
 )
 from types import SimpleNamespace
 
@@ -76,45 +77,8 @@ def train(args):
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        tracker_config = vars(copy.deepcopy(args))
-        accelerator.init_trackers("dreambooth-lora", config=tracker_config)
-
-    # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    global_step = 0
-    first_epoch = 0
-
-    # Potentially load in the weights and states from a previous save
-    initial_global_step = 0
-    if args.resume_from_checkpoint:
-        accelerator.print(f"Resuming from checkpoint {args.resume_from_checkpoint}")
-        global_step = int(args.resume_from_checkpoint.split("-")[1])
-
-        initial_global_step = global_step
-        first_epoch = global_step // num_update_steps_per_epoch
-
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
-        initial=initial_global_step,
-        desc="Steps",
-        disable=not accelerator.is_local_main_process,
-    )
+    global_step, first_epoch, progress_bar = more_init([unet, text_encoder], accelerator, args, train_dataloader, 
+                                                        train_dataset, logger, num_update_steps_per_epoch, wandb_name="diffusion_lora")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -140,15 +104,7 @@ def train(args):
                     return_dict=False,
                 )[0]
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

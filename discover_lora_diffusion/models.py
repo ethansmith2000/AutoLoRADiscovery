@@ -1,62 +1,14 @@
 import torch
 from torch import nn
 import math
+import torch
+import torch.nn as nn
+import numpy as np
+import math
+import sys
+sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
 
-
-def get_timestep_embedding(
-    timesteps: torch.Tensor,
-    embedding_dim: int,
-    downscale_freq_shift: float = 1,
-    max_period: int = 10000,
-):
-    half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
-    exponent = exponent / (half_dim - downscale_freq_shift)
-
-    emb = timesteps[:, None].float() * torch.exp(exponent)[None, :]
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-
-    # zero pad
-    if embedding_dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
-    return emb
-
-
-class TimestepEmbedding(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        time_embed_dim: int,
-        bias=True,
-    ):
-        super().__init__()
-        self.linear_1 = nn.Linear(in_channels, time_embed_dim, bias=bias)
-        self.act = nn.SiLU()
-        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim, bias=bias)
-
-
-    def forward(self, timestep):
-        timestep = get_timestep_embedding(timestep, self.linear_1.in_features)
-        timestep = self.linear_1(timestep)
-        timestep = self.act(timestep)
-        timestep = self.linear_2(timestep)
-        return timestep
-
-
-class AdaNorm(nn.Module):
-
-    def __init__(self, in_dim, ada_dim):
-        super().__init__()
-        self.ada_proj = nn.Linear(ada_dim, 2 * in_dim)
-        self.norm = nn.LayerNorm(in_dim, elementwise_affine=False)
-
-    def forward(self, hidden_states, ada_embed):
-        hidden_states = self.norm(hidden_states)
-        ada_embed = self.ada_proj(ada_embed)
-        scale, shift = ada_embed.chunk(2, dim=1)
-        hidden_states = hidden_states * (1 + scale) + shift
-        return hidden_states
-
+from common.models import TimestepEmbedding, AdaNorm, ChunkFanOut, Attention, FeedForward, DiTBlock
 
 class Resnet(nn.Module):
 
@@ -92,29 +44,6 @@ class Resnet(nn.Module):
 
         return hidden_states + resid
 
-
-class ChunkFanIn(torch.nn.Module):
-
-    def __init__(self, in_dim, out_dim, chunks=1):
-        super().__init__()
-        assert in_dim % chunks == 0
-        self.projs = nn.ModuleList([nn.Linear(in_dim // chunks, out_dim) for _ in range(chunks)])
-        self.in_dim = in_dim
-        self.chunk_dim = in_dim // chunks
-
-    def forward(self, x):
-        return torch.stack([proj(x[..., (i * self.chunk_dim) : ((i+1) * self.chunk_dim)]) for i, proj in enumerate(self.projs)], dim=1).sum(dim=1)
-
-
-class ChunkFanOut(torch.nn.Module):
-
-    def __init__(self, in_dim, out_dim, chunks=1):
-        super().__init__()
-        assert out_dim % chunks == 0
-        self.projs = nn.ModuleList([nn.Linear(in_dim, out_dim // chunks) for _ in range(chunks)])
-
-    def forward(self, x):
-        return torch.cat([proj(x) for proj in self.projs], dim=1)
 
 
 class Encoder(torch.nn.Module):
@@ -157,3 +86,68 @@ class LoraDiffusion(torch.nn.Module):
     def forward(self, x, t):
         ada_emb = self.time_embed(t)
         return self.decoder(self.encoder(x, ada_emb), ada_emb)
+
+
+
+
+class DiT(nn.Module):
+    def __init__(
+        self,
+        total_dim=1_365_504,
+        dim = 1536,
+        num_tokens=889,
+        time_dim = 384,
+        depth=12,
+        num_heads=16,
+        mlp_ratio=4.0,
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.num_tokens = num_tokens
+
+        self.proj_in = torch.nn.Linear(dim, dim)
+        self.time_embed =  TimestepEmbedding(time_dim, time_dim)
+
+        self.pos_embed = nn.Parameter(torch.randn(1, num_tokens, dim) * 0.02)
+        self.blocks = nn.ModuleList([DiTBlock(dim, time_dim, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=True)
+        self.proj_out = nn.Linear(dim, dim)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, t):
+        """
+        Forward pass of DiT.
+        x: (N, C) tensor of spatial inputs (images or latent representations of images)
+        t: (N,) tensor of diffusion timesteps
+        """
+        x = x.reshape(x.size(0), -1, self.dim)
+        x = self.proj_in(x) + self.pos_embed.expand(x.size(0), -1, -1)
+        t = self.time_embed(t)
+        for block in self.blocks:
+            x = block(x, t)
+        x = self.norm_out(x)
+        x = self.proj_out(x)
+        x = x.reshape(x.size(0), -1)
+        return x
+
+
+
+
+
+
+#

@@ -6,7 +6,9 @@ import pandas as pd
 import re
 import glob
 from pathlib import Path
+import torch.nn.functional as F
 import torch
+import random
 
 def open_weights(path):
     try: # if ".safetensors" in path:
@@ -27,11 +29,6 @@ def get_num_params(state_dict):
 def convert_to_multi(state_dict, idx=0):
     new_state_dict = {}
     for k,v in state_dict.items():
-        # single lora method to multi
-        k = k.replace(".weight", f".{idx}")
-        k = k.replace("lora_weight", f"lora_weight.{idx}")
-        k = k.replace("lora_bias", f"lora_bias.{idx}")
-
         # changing index 
         k = re.sub(r"lora_down\.(\d+)", f"lora_down.{idx}", k)
         k = re.sub(r"lora_up\.(\d+)", f"lora_up.{idx}", k)
@@ -79,8 +76,9 @@ def make_weight_vector(state_dict):
     for k in keys:
         weight = state_dict[k]
         if isinstance(weight, torch.Tensor):
+            shape = weight.shape
             flattened = weight.flatten()
-            interval = (idx, idx + len(flattened))
+            interval = (idx, idx + len(flattened), shape)
             idx = idx + len(flattened)
             weight_dict[k] = interval
             weights.append(flattened)
@@ -88,31 +86,81 @@ def make_weight_vector(state_dict):
     return torch.cat(weights), weight_dict
 
 
+# def slerp(a, b, t):
+#     omega = torch.acos((a / a.norm()).dot(b / b.norm()))
+#     so = torch.sin(omega)
+#     return torch.sin((1.0 - t) * omega) / so * a + torch.sin(t * omega) / so * b
+
+
+def batch_slerp(a, b, t):
+    if len(t.shape) == 1:
+        t = t[..., None]
+    dot = (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(dim=-1)[...,None].clamp(-0.999999, 0.999999)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega)
+    part1 = torch.sin((1.0 - t) * omega) / sin_omega * a
+    part2 = torch.sin(t * omega) / sin_omega * b
+    return part1 + part2
+
+
+def recover_lora(lora_vector, weight_dict):
+    state_dict = {}
+    prev_idx = 0
+    for k, stuff in weight_dict.items():
+        start = stuff[0]
+        end = stuff[1]
+        shape = stuff[2]
+        assert start >= prev_idx
+        state_dict[k] = lora_vector[0, start:end].view(shape)
+        prev_idx = end
+    return state_dict
+
+
+def lerp(a, b, t):
+    return a * (1 - t) + b * t
+
+
 @torch.no_grad()
-def rand_merge_simple(lora_a, lora_b):
+def rand_merge_layerwise(lora_a, lora_b, weight_dict, slerp=True):
     b, n = lora_a.shape
-    coef = torch.rand(b)
-    out = lora_a * coef[:,None] + lora_b * (1 -coef[:,None])
+    interp_fn = batch_slerp if slerp else lerp
+    out = torch.zeros(b, n).cuda()
+    for k in weight_dict.keys():
+        start = weight_dict[k][0]
+        end = weight_dict[k][1]
+        coef = torch.rand(b, 1).expand(b, end-start).cuda()
+        # out[:, start:end] = batch_slerp(lora_a[:, start:end], lora_b[:, start:end], coef)
+        out[:, start:end] = interp_fn(lora_a[:, start:end], lora_b[:, start:end], coef)
+
+    return out
+
+@torch.no_grad()
+def rand_merge(lora_a, lora_b, slerp=True):
+    interp_fn = batch_slerp if slerp else lerp
+    coef = torch.rand(lora_a.shape[0], 1).cuda()
+    # out = batch_slerp(lora_a, lora_b, coef)
+    out = interp_fn(lora_a, lora_b, coef)
     return out
 
 
-@torch.no_grad()
-def rand_merge_layerwise(lora_a, lora_b):
-    new_state_dict = {}
-    for k in lora_a.keys():
-        val_a = lora_a[k]
-        val_b = lora_b[k]
-        coef = torch.rand(1)
-        new_state_dict[k] = val_a * coef + val_b * (1-coef)
+def augmentations(batch, weight_dict, first=0.9, second=0.35, third=0.01, slerp=True):
+    orig_batch = batch
+    if random.random() < first:
+        batch = rand_merge(orig_batch, batch.flip(0))
+        if random.random() < second:
+            perm = torch.randperm(batch.shape[0])
+            if random.random() < 0.5:
+                batch = rand_merge(batch, batch[perm], slerp)
+            else:
+                batch = rand_merge(batch, orig_batch[perm], slerp)
     
-    return new_state_dict
+    # if random.random() < third:
+    #     perm = torch.randperm(batch.shape[0])
+    #     batch = rand_merge_layerwise(batch, batch[perm],weight_dict, slerp)
+
+    return batch
 
 
-# @torch.no_grad()
-# def rand_merge_layerwise(lora_a, lora_b, weight_dict):
-#     b, n = a.shape
-
-#     coef = torch.rand(b, len(weight_dict))
 
 
 

@@ -26,23 +26,6 @@ from types import SimpleNamespace
 import sys
 sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
 
-# from common import utils
-# from common import loras
-# from common import train_utils
-
-# from utils import convert_to_multi
-# from loras import patch_lora
-# from train_utils import (
-#     collate_fn,
-#     init_train_basics,
-#     log_validation,
-#     unwrap_model,
-#     MyDataset,
-#     load_models,
-#     get_train_stuff,
-#     save_model,
-# )
-
 from common.utils import convert_to_multi
 from common.loras import patch_lora
 from common.train_utils import (
@@ -55,6 +38,7 @@ from common.train_utils import (
     get_optimizer,
     get_dataset,
     save_model,
+    more_init,
 )
 
 
@@ -64,7 +48,8 @@ default_arguments = dict(
     revision="main",
     variant=None,
     tokenizer_name=None,
-    instance_data_dir="/home/ubuntu/AutoLoRADiscovery/people/Jeff Bezos",
+    # instance_data_dir="/home/ubuntu/AutoLoRADiscovery/people/Jeff Bezos",
+    instance_data_dir="/home/ubuntu/AutoLoRADiscovery/me",
     num_validation_images=4,
     num_class_images=100,
     output_dir="PCLora",
@@ -72,7 +57,7 @@ default_arguments = dict(
     resolution=640,
     center_crop=False,
     train_batch_size=1,
-    max_train_steps=1250,
+    max_train_steps=2000,
     validation_steps=250,
     num_dataloader_repeats=100,
     checkpointing_steps=500,
@@ -81,17 +66,17 @@ default_arguments = dict(
     gradient_accumulation_steps=1,
     gradient_checkpointing=False,
     # learning_rate=1.0e-4,
-    learning_rate=6.0e-5,
+    learning_rate=15.0e-3,
     # learning_rate=2.5e-5,
     scale_lr=False,
-    lr_scheduler="constant",
+    lr_scheduler="linear",
     lr_warmup_steps=50,
     lr_num_cycles=1,
     lr_power=1.0,
     dataloader_num_workers=4,
     use_8bit_adam=False,
     adam_beta1=0.9,
-    adam_beta2=0.99,
+    adam_beta2=0.985,
     adam_weight_decay=1e-2,
     adam_epsilon=1e-08,
     max_grad_norm=1.0,
@@ -124,6 +109,8 @@ default_arguments = dict(
     ],
     train_text_encoder=True,
     bundle_lora_path="/home/ubuntu/AutoLoRADiscovery/lora_bundle.pt",
+
+    weight_mode = "global", # ["global", "one", "two"]
 )
 
 
@@ -141,11 +128,11 @@ def train(args):
     num_loras = len(bundle_lora)
 
     # now we will add new LoRA weights to the attention layers
-    patch_lora(unet, rank=args.lora_rank, included_terms=args.lora_layers, num_loras=num_loras)
+    patch_lora(unet, rank=args.lora_rank, included_terms=args.lora_layers, num_loras=num_loras, weight_mode=args.weight_mode)
 
     # The text encoder comes from transformers, we will also attach adapters to it.
     if args.train_text_encoder:
-        patch_lora(text_encoder, rank=args.lora_rank, included_terms=args.lora_layers_te, num_loras=num_loras)
+        patch_lora(text_encoder, rank=args.lora_rank, included_terms=args.lora_layers_te, num_loras=num_loras, weight_mode=args.weight_mode)
 
     if isinstance(bundle_lora, list):
         bundle_lora = [convert_to_multi(lora, i) for i, lora in enumerate(bundle_lora)]
@@ -154,7 +141,7 @@ def train(args):
             bundle_dict.update(lora)
     
     # save it
-    torch.save(bundle_lora, args.bundle_lora_path)
+    # torch.save(bundle_lora, args.bundle_lora_path)
     missing, unexpected = text_encoder.load_state_dict(bundle_dict, strict=False)
     missing, unexpected = unet.load_state_dict(bundle_dict, strict=False)
 
@@ -164,6 +151,20 @@ def train(args):
     if args.train_text_encoder:
         params_to_optimize = params_to_optimize + [p for n,p in text_encoder.named_parameters() if "each_scale" in n]
         names_to_optimize = names_to_optimize + [n for n,p in text_encoder.named_parameters() if "each_scale" in n]
+    
+    keyword = "each"
+    if args.weight_mode == "global":
+        keyword = "global_weight"
+        unet.register_parameter("global_weight", torch.nn.Parameter(torch.ones(num_loras) / num_loras))
+        params_to_optimize.append(unet.global_weight)
+        names_to_optimize.append("global_w")
+        for n, m in unet.named_modules():
+            if hasattr(m, "global_w"):
+                m.global_w["global_w"] = unet.global_weight
+        if args.train_text_encoder:
+            for n, m in text_encoder.named_modules():
+                if hasattr(m, "global_w"):
+                    m.global_w["global_w"] = unet.global_weight
     
     num_params = sum(p.numel() for p in params_to_optimize)
     args.num_params = num_params
@@ -178,45 +179,8 @@ def train(args):
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        tracker_config = vars(copy.deepcopy(args))
-        accelerator.init_trackers("dreambooth-lora", config=tracker_config)
-
-    # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    global_step = 0
-    first_epoch = 0
-
-    # Potentially load in the weights and states from a previous save
-    initial_global_step = 0
-    if args.resume_from_checkpoint:
-        accelerator.print(f"Resuming from checkpoint {args.resume_from_checkpoint}")
-        global_step = int(args.resume_from_checkpoint.split("-")[1])
-
-        initial_global_step = global_step
-        first_epoch = global_step // num_update_steps_per_epoch
-
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
-        initial=initial_global_step,
-        desc="Steps",
-        disable=not accelerator.is_local_main_process,
-    )
+    global_step, first_epoch, progress_bar = more_init([unet, text_encoder], accelerator, args, train_dataloader, 
+                                                    train_dataset, logger, num_update_steps_per_epoch, wandb_name="PC-lora")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -242,15 +206,7 @@ def train(args):
                     return_dict=False,
                 )[0]
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -267,7 +223,7 @@ def train(args):
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        save_model(unet, text_encoder,accelerator,save_path, args, logger)
+                        save_model(unet, text_encoder,accelerator,save_path, args, logger, keyword=keyword)
                         
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -294,8 +250,18 @@ def train(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        images = log_validation(
+            unet,
+            text_encoder,
+            weight_dtype,
+            args,
+            accelerator,
+            pipeline_args={"prompt": args.validation_prompt, "height": args.resolution, "width": args.resolution},
+            epoch=epoch,
+            logger=logger,
+        )
         save_path = os.path.join(args.output_dir, "lora_layers.pth")
-        save_model(unet, text_encoder, accelerator, save_path, args, logger)
+        save_model(unet, text_encoder, accelerator, save_path, args, logger, keyword=keyword)
 
     accelerator.end_training()
 
