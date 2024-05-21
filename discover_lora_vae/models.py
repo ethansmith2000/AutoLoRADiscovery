@@ -18,9 +18,9 @@ class Resnet(nn.Module):
         act = torch.nn.SiLU,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(in_dim)
+        self.norm1 = nn.LayerNorm(mid_dim)
         self.linear1 = nn.Linear(in_dim, mid_dim)
-        self.norm2 = nn.LayerNorm(mid_dim)
+        self.norm2 = nn.LayerNorm(in_dim)
         self.dropout = torch.nn.Dropout(dropout)
         self.linear2 = nn.Linear(mid_dim, in_dim)
         self.act = act()
@@ -33,8 +33,8 @@ class Resnet(nn.Module):
 
         resid = hidden_states
 
-        hidden_states = self.linear1(self.act(self.norm1(hidden_states)))
-        hidden_states = self.linear2(self.dropout(self.act(self.norm2(hidden_states))))
+        hidden_states = self.norm1(self.act(self.linear1(hidden_states)))
+        hidden_states = self.norm2(self.act(self.linear2(hidden_states)))
 
         return hidden_states + resid
 
@@ -62,6 +62,7 @@ class Decoder(torch.nn.Module):
         self.in_proj = nn.Linear(model_dim, model_dim)
         self.resnets = nn.ModuleList([Resnet(model_dim, int(model_dim * ff_mult), act=act) for _ in range(num_layers)])
         self.out_proj = ChunkFanOut(model_dim, data_dim, chunks=out_proj_chunks)
+        
 
     def forward(self, x):
         x = self.in_proj(x)
@@ -145,7 +146,7 @@ class VAET(nn.Module):
         mean, logvar = self.encode(x)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        z = mean + eps * std
+        z = mean + std * eps
         return self.decode(z), mean, logvar
 
 

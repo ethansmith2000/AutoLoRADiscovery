@@ -68,7 +68,7 @@ def get_dataset(args):
 
 
 default_arguments = dict(
-    data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle_for_model.pt",
+    data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle.pt",
     output_dir="vae_lora",
     seed=None,
     train_batch_size=32,
@@ -100,7 +100,7 @@ default_arguments = dict(
 
     data_dim = 1_365_504,
 
-    kld_weight = 0.005,
+    kld_weight = 0.001,
 
     lora_std = 0.0152,
     num_latent_tokens = 1
@@ -113,20 +113,20 @@ def train(args):
     accelerator, weight_dtype = init_train_basics(args, logger)
 
     # lora_vae = LoraVAE(data_dim=args.data_dim,
-    #                     model_dim=256,
+    #                     model_dim=512,
     #                     ff_mult=3.0,
     #                     chunks=1,
     #                     # act=args.act,
-    #                     encoder_layers=6,
+    #                     encoder_layers=8,
     #                     decoder_layers=12
     #                     )
 
     lora_vae = VAET(
         total_dim=args.data_dim,
-        dim = 768*2,
-        num_tokens=889,
-        encoder_depth = 8,
-        decoder_depth = 8,
+        dim = 768,
+        num_tokens=889*2,
+        encoder_depth = 6,
+        decoder_depth = 6,
         num_heads = 16,
         mlp_ratio = 3.0,
         num_latent_tokens=args.num_latent_tokens
@@ -151,7 +151,7 @@ def train(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_vae):
                 batch = batch.to(accelerator.device) * (1 / args.lora_std)
-                batch = augmentations(batch, weight_dict, slerp=True)
+                # batch = augmentations(batch, weight_dict, slerp=True)
 
                 pred, mean, logvar = lora_vae(batch)
                 mse_loss = F.mse_loss(pred.float(), batch.float(), reduction="mean")
