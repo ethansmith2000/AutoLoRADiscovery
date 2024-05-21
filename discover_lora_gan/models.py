@@ -3,7 +3,7 @@ from torch import nn
 
 
 import sys
-sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
+sys.path.append('..')
 
 from common.models import ChunkFanOut, DiTBlockNoAda, AttentionResampler
 

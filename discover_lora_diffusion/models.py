@@ -6,7 +6,7 @@ import torch.nn as nn
 import numpy as np
 import math
 import sys
-sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
+sys.path.append('..')
 
 from common.models import TimestepEmbedding, AdaNorm, ChunkFanOut, Attention, FeedForward, DiTBlock
 

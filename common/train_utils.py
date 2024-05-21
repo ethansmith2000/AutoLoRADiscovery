@@ -412,7 +412,7 @@ default_arguments = dict(
 
 def resume_model(model, args, accelerator, num_update_steps_per_epoch):
     accelerator.print(f"Resuming from checkpoint {args.resume_from_checkpoint}")
-    global_step = int(args.resume_from_checkpoint.split("-")[1])
+    global_step = int(args.resume_from_checkpoint.split("-")[-1])
     state_dict = torch.load(args.resume_from_checkpoint, map_location="cpu")
 
     if not isinstance(model, list):

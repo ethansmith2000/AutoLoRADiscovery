@@ -8,7 +8,7 @@ from accelerate.logging import get_logger
 from tqdm.auto import tqdm
 
 import sys
-sys.path.append('/home/ubuntu/AutoLoRADiscovery/')
+sys.path.append('..')
 
 from common.loras import patch_lora
 from common.utils import make_weight_vector, augmentations
