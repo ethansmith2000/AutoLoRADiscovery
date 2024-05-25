@@ -18,7 +18,8 @@ from common.train_utils import (
     save_model,
     unwrap_model,
     get_optimizer,
-    more_init
+    more_init,
+    resume_model
 )
 
 from types import SimpleNamespace
@@ -32,9 +33,9 @@ class LoraDataset(Dataset):
     def __init__(
         self,
         lora_bundle_path,
-        num_dataloader_repeats=10,
+        num_dataloader_repeats=10, # this could blow up memory be careful!
     ):
-        self.lora_bundle = torch.load(lora_bundle_path) #* num_dataloader_repeats
+        self.lora_bundle = torch.load(lora_bundle_path)
         self.lora_bundle = [make_weight_vector(state_dict) for state_dict in self.lora_bundle]
         self.weight_dict = self.lora_bundle[0][1]
         self.lora_bundle = [x[0] for x in self.lora_bundle] * num_dataloader_repeats
@@ -112,20 +113,20 @@ def get_loss(noise_pred, noise, timesteps, noise_scheduler, snr_gamma=None):
     return loss.mean()
 
 default_arguments = dict(
-    data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle_for_model.pt",
+    data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle.pt",
     output_dir="diffusion_lora",
     seed=None,
-    train_batch_size=40,
-    max_train_steps=30_000,
+    train_batch_size=64,
+    max_train_steps=80_000,
     # validation_steps=250,
     num_dataloader_repeats=100,
     checkpointing_steps=2000,
-    resume_from_checkpoint=None,
+    resume_from_checkpoint="/home/ubuntu/AutoLoRADiscovery/discover_lora_diffusion/diffusion_lora/checkpoint-76000",
     gradient_accumulation_steps=1,
     gradient_checkpointing=False,
-    learning_rate=1.5e-5,
+    learning_rate=1.0e-4,
     lr_scheduler="linear",
-    lr_warmup_steps=50,
+    lr_warmup_steps=200,
     lr_num_cycles=1,
     lr_power=1.0,
     dataloader_num_workers=4,
@@ -142,7 +143,9 @@ default_arguments = dict(
     local_rank=-1,
     num_processes=1,
     snr_gamma=None,
-    lora_std = 0.0152
+    lora_std = 0.0152,
+    use_wandb=True
+    
 )
 
 
@@ -151,26 +154,27 @@ def train(args):
     args = SimpleNamespace(**args)
     accelerator, weight_dtype = init_train_basics(args, logger)
 
-    # lora_diffusion = LoraDiffusion(data_dim=args.data_dim,
-    #                     model_dim=args.model_dim,
-    #                     ff_mult=args.ff_mult,
-    #                     chunks=args.chunks,
-    #                     act=args.act,
-    #                     encoder_layers=args.encoder_layers,
-    #                     decoder_layers=args.decoder_layers
-    #                     )
-
-    lora_diffusion = DiT(
-        total_dim=1_365_504,
-        dim = 1536,
-        num_tokens=889,
-        time_dim = 384,
-        depth=12,
-        num_heads=16,
-        mlp_ratio=4.0,
+    lora_diffusion = LoraDiffusion(
+        data_dim=1_365_504,
+        model_dim=256,
+        ff_mult=3,
+        chunks=1,
+        act=torch.nn.SiLU,
+        num_blocks=4,
+        layers_per_block=3
     )
 
-    scheduler = diffusers.DDIMScheduler.from_config("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
+    # lora_diffusion = DiT(
+    #     total_dim=1_365_504,
+    #     dim = 1536,
+    #     num_tokens=889,
+    #     time_dim = 384,
+    #     depth=12,
+    #     num_heads=16,
+    #     mlp_ratio=4.0,
+    # )
+
+    scheduler = diffusers.UnCLIPScheduler.from_config("kandinsky-community/kandinsky-2-2-prior", subfolder="scheduler")
 
     params_to_optimize = list(lora_diffusion.parameters())
     train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args)
@@ -183,8 +187,14 @@ def train(args):
         lora_diffusion, optimizer, train_dataloader, lr_scheduler
     )
 
-    global_step, first_epoch, progress_bar = more_init(lora_diffusion, accelerator, args, train_dataloader, 
-                                                        train_dataset, logger, num_update_steps_per_epoch, wandb_name="diffusion_lora")
+    global_step = 0
+    if args.resume_from_checkpoint:
+        global_step = resume_model(lora_diffusion, args.resume_from_checkpoint, accelerator)
+
+
+    global_step, first_epoch, progress_bar = more_init(accelerator, args, train_dataloader, 
+                                                        train_dataset, logger, num_update_steps_per_epoch, 
+                                                        global_step, wandb_name="diffusion_lora")
 
 
     for epoch in range(first_epoch, args.num_train_epochs):
@@ -192,7 +202,10 @@ def train(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_diffusion):
                 batch = batch.to(accelerator.device) * (1 / args.lora_std)
-                batch = augmentations(batch, weight_dict)
+                batch = augmentations(batch, weight_dict, first=0.95, second=0.65, second_w_orig=0.5, 
+                                                        third=0.45, third_w_orig=0.5, 
+                                                        layerwise=0.0, 
+                                                        null_p=0.001)
 
                 noise = torch.randn_like(batch)
                 timesteps = torch.randint(
@@ -202,7 +215,8 @@ def train(args):
                 noisy_model_input = scheduler.add_noise(batch, noise, timesteps)
 
                 pred = lora_diffusion(noisy_model_input, timesteps)
-                loss = get_loss(pred, noise, timesteps, scheduler, snr_gamma=args.snr_gamma)
+                loss = F.mse_loss(pred, batch, reduction="mean")
+                # loss = get_loss(pred, noise, timesteps, scheduler, snr_gamma=args.snr_gamma)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -223,7 +237,8 @@ def train(args):
 
             logs = {"mse_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            if args.use_wandb:
+                accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break

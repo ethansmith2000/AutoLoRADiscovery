@@ -18,7 +18,8 @@ from common.train_utils import (
     save_model,
     unwrap_model,
     get_optimizer,
-    more_init
+    more_init,
+    resume_model
 )
 
 from types import SimpleNamespace
@@ -31,9 +32,9 @@ class LoraDataset(Dataset):
     def __init__(
         self,
         lora_bundle_path,
-        num_dataloader_repeats=10,
+        num_dataloader_repeats=20, # this could blow up memory be careful!
     ):
-        self.lora_bundle = torch.load(lora_bundle_path) #* num_dataloader_repeats
+        self.lora_bundle = torch.load(lora_bundle_path)
         self.lora_bundle = [make_weight_vector(state_dict) for state_dict in self.lora_bundle]
         self.weight_dict = self.lora_bundle[0][1]
         self.lora_bundle = [x[0] for x in self.lora_bundle] * num_dataloader_repeats
@@ -68,15 +69,16 @@ def get_dataset(args):
 
 
 default_arguments = dict(
-    data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle_for_model.pt",
-    output_dir="vae_lora",
+    data_dir="/home/ubuntu/AutoLoRADiscovery/lora_bundle.pt",
+    output_dir="model_output",
     seed=None,
-    train_batch_size=32,
-    max_train_steps=6000,
+    train_batch_size=64,
+    max_train_steps=25_000,
     # validation_steps=250,
     num_dataloader_repeats=100,
     checkpointing_steps=2000,
-    resume_from_checkpoint=None,
+    resume_from_checkpoint_generator=None,
+    resume_from_checkpoint_discriminator=None,
     gradient_accumulation_steps=1,
     gradient_checkpointing=False,
     learning_rate=1.0e-4,
@@ -100,10 +102,8 @@ default_arguments = dict(
 
     data_dim = 1_365_504,
 
-    kld_weight = 0.005,
-
     lora_std = 0.0152,
-    num_latent_tokens = 1
+    use_wandb=True
 )
 
 
@@ -113,19 +113,17 @@ def train(args):
     accelerator, weight_dtype = init_train_basics(args, logger)
 
     lora_generator = Generator(
-                        dim = 1536,
-                        num_tokens=889,
-                        num_layers=6,
-                        num_heads=16,
-                        mlp_ratio=3.0,
-                        latent_dim=64,)
+                        data_dim=1_365_504, 
+                        model_dim=256, 
+                        latent_dim=64, 
+                        ff_mult=3, 
+                        num_layers=12)
 
     lora_discriminator = Discriminator(
-                        dim = 1536,
-                        num_tokens=889,
-                        num_layers=4,
-                        num_heads=16,
-                        mlp_ratio=3.0,)
+                        data_dim=1_365_504, 
+                        model_dim=256, 
+                        ff_mult=3, 
+                        num_layers=12, )
 
     train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args)
     optimizer_g, lr_scheduler_g = get_optimizer(args, list(lora_generator.parameters()), accelerator)
@@ -138,8 +136,15 @@ def train(args):
         lora_generator, lora_discriminator, optimizer_g, optimizer_d, train_dataloader, lr_scheduler_g, lr_scheduler_d
     )
 
-    global_step, first_epoch, progress_bar = more_init([lora_generator, lora_discriminator], accelerator, args, train_dataloader, 
-                                                        train_dataset, logger, num_update_steps_per_epoch, wandb_name="gan_lora_1")
+    global_step = 0
+    if args.resume_from_checkpoint_generator:
+        global_step = resume_model(lora_generator, args.resume_from_checkpoint_generator, accelerator)
+    if args.resume_from_checkpoint_discriminator:
+        global_step = resume_model(lora_discriminator, args.resume_from_checkpoint_discriminator, accelerator)
+
+    global_step, first_epoch, progress_bar = more_init(accelerator, args, train_dataloader, 
+                                                        train_dataset, logger, 
+                                                        num_update_steps_per_epoch, global_step, wandb_name="gan_lora_1")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         lora_generator.train()
@@ -156,7 +161,7 @@ def train(args):
                 real = lora_discriminator(batch)
                 fake = lora_discriminator(fake)
 
-                loss_d = (F.binary_cross_entropy_with_logits(real, torch.ones_like(real)) + F.binary_cross_entropy_with_logits(fake, torch.zeros_like(fake))) / 2
+                loss_d = (F.binary_cross_entropy_with_logits(real, torch.ones_like(real)) + F.binary_cross_entropy_with_logits(fake, torch.zeros_like(fake))) / 1
                 loss_d.backward()
                 optimizer_d.step()
                 optimizer_d.zero_grad(set_to_none=True)
@@ -179,12 +184,15 @@ def train(args):
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(args.output_dir, f"checkpoint-generator-{global_step}")
                         torch.save(unwrap_model(accelerator, lora_generator).state_dict(), save_path)
+                        save_path = os.path.join(args.output_dir, f"checkpoint-discriminator-{global_step}")
+                        torch.save(unwrap_model(accelerator, lora_discriminator).state_dict(), save_path)
 
             logs = {"loss_d": loss_d.detach().item(), "lr": lr_scheduler_g.get_last_lr()[0], "loss_g": loss_g.detach().item()}
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            if args.use_wandb:
+                accelerator.log(logs, step=global_step) 
 
             if global_step >= args.max_train_steps:
                 break
@@ -197,6 +205,8 @@ def train(args):
     if accelerator.is_main_process:
         save_path = os.path.join(args.output_dir, "lora_generator.pth")
         torch.save(unwrap_model(accelerator, lora_generator).state_dict(), save_path)
+        save_path = os.path.join(args.output_dir, "lora_discriminator.pth")
+        torch.save(unwrap_model(accelerator, lora_discriminator).state_dict(), save_path)
 
     accelerator.end_training()
 

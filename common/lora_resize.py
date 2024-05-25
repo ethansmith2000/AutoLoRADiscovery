@@ -180,7 +180,7 @@ def change_lora_rank(state_dict,
 
     for key in tqdm(weights_with_lora):
         with torch.no_grad():
-            lora_down_key, lora_up_key = key + f".{down_name}.weight", key + f".{up_name}.weight"
+            lora_down_key, lora_up_key = key + f".{down_name}.0", key + f".{up_name}.0"
             lora_down, lora_up = state_dict[lora_down_key], state_dict[lora_up_key]
             if "conv" in key:
                 # out, rank, 1, 1

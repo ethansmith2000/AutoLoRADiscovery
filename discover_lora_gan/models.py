@@ -5,87 +5,57 @@ from torch import nn
 import sys
 sys.path.append('..')
 
-from common.models import ChunkFanOut, DiTBlockNoAda, AttentionResampler
-
-
-class Resnet(nn.Module):
-
-    def __init__(
-        self,
-        in_dim: int,
-        mid_dim: int,
-        dropout: float = 0.0,
-        act = torch.nn.SiLU,
-    ):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(in_dim)
-        self.linear1 = nn.Linear(in_dim, mid_dim)
-        self.norm2 = nn.LayerNorm(mid_dim)
-        self.dropout = torch.nn.Dropout(dropout)
-        self.linear2 = nn.Linear(mid_dim, in_dim)
-        self.act = act()
-
-
-    def forward(
-        self,
-        hidden_states,
-    ) -> torch.FloatTensor:
-
-        resid = hidden_states
-
-        hidden_states = self.linear1(self.act(self.norm1(hidden_states)))
-        hidden_states = self.linear2(self.dropout(self.act(self.norm2(hidden_states))))
-
-        return hidden_states + resid
+from common.models import ChunkFanOut, DiTBlockNoAda, AttentionResampler, Resnet
 
 
 
-class Discriminator(nn.Module):
-    def __init__(self, total_dim=1_365_504,
-                        dim = 1536,
-                        num_tokens=889,
-                        num_layers=6,
-                        num_heads=16,
-                        mlp_ratio=4.0,):
-        super().__init__()
-        self.dim = dim
-        self.proj_in = nn.Linear(dim, dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, num_tokens, dim) * 0.02)
-        self.blocks = nn.ModuleList([DiTBlockNoAda(dim, num_heads, mlp_ratio=mlp_ratio) for _ in range(num_layers)])
-        self.pool = AttentionResampler(dim, 1)
-        self.norm_out = nn.LayerNorm(dim)
-        self.proj_out = nn.Linear(dim, 1)
-
-    def forward(self, x):
-        x = x.reshape(x.size(0), -1, self.dim)
-        x = self.proj_in(x) + self.pos_embed.expand(x.size(0), -1, -1)
-        for block in self.blocks:
-            x = block(x)
-        x = self.proj_out(self.norm_out(self.pool(x))).squeeze(-1)
-        return x
-
-
-
-class Generator(nn.Module):
-    def __init__(self, total_dim=1_365_504,
-                        dim = 1536,
-                        num_tokens=889,
-                        num_layers=6,
-                        num_heads=16,
-                        mlp_ratio=4.0,
-                        latent_dim=64,
+class Discriminator(torch.nn.Module):
+    def __init__(self, data_dim=1_365_504, 
+                        model_dim=256, 
+                        ff_mult=3, 
+                        in_proj_chunks=1, 
+                        act=torch.nn.SiLU, 
+                        num_layers=6, 
                         ):
         super().__init__()
-        self.num_tokens = num_tokens
-        self.proj_in = nn.Linear(latent_dim, dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, num_tokens, dim) * 0.02)
-        self.blocks = nn.ModuleList([DiTBlockNoAda(dim, num_heads, mlp_ratio=mlp_ratio) for _ in range(num_layers)])
-        self.norm_out = nn.LayerNorm(dim)
-        self.proj_out = nn.Linear(dim, dim)
+        self.in_norm = nn.LayerNorm(data_dim)
+        self.in_proj = ChunkFanOut(data_dim, model_dim, chunks=in_proj_chunks)
+        self.resnets = nn.ModuleList([Resnet(model_dim, int(model_dim * ff_mult), act=act) for _ in range(num_layers)])
+        self.out_norm = nn.LayerNorm(model_dim)
+        self.out_proj = nn.Linear(model_dim, 1)
 
     def forward(self, x):
-        x = self.proj_in(x)[:,None,:].expand(-1, self.num_tokens, -1) + self.pos_embed.expand(x.size(0), -1, -1)
-        for block in self.blocks:
-            x = block(x)
-        x = self.proj_out(self.norm_out(x)).reshape(x.size(0), -1)
+        x = self.in_norm(x)
+        x = self.in_proj(x)
+        for resnet in self.resnets:
+            x = resnet(x)
+        x = self.out_norm(x)
+        return self.out_proj(x)
+
+
+class Generator(torch.nn.Module):
+    def __init__(self, data_dim=1_365_504, 
+                        model_dim=256, 
+                        latent_dim=64, 
+                        ff_mult=3, 
+                        out_proj_chunks=1, 
+                        act=torch.nn.SiLU, 
+                        num_layers=6):
+        super().__init__()
+        self.in_norm = nn.LayerNorm(latent_dim)
+        self.in_proj = nn.Linear(latent_dim, model_dim)
+        self.resnets = nn.ModuleList([Resnet(model_dim, int(model_dim * ff_mult), act=act) for _ in range(num_layers)])
+        self.out_proj = ChunkFanOut(model_dim, data_dim, chunks=out_proj_chunks)
+        self.out_norm = nn.LayerNorm(model_dim)
+        # self.out_norm_2 = nn.LayerNorm(data_dim) # this is a nice way to get full size parameters while still fairly cheap
+        
+
+    def forward(self, x):
+        x = self.in_norm(x)
+        x = self.in_proj(x)
+        for resnet in self.resnets:
+            x = resnet(x)
+        x = self.out_norm(x)
+        x = self.out_proj(x)
         return x
+

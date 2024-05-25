@@ -77,8 +77,13 @@ def train(args):
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler
     )
 
-    global_step, first_epoch, progress_bar = more_init([unet, text_encoder], accelerator, args, train_dataloader, 
-                                                        train_dataset, logger, num_update_steps_per_epoch, wandb_name="diffusion_lora")
+    global_step = 0
+    if args.resume_from_checkpoint:
+        global_step = resume_model(unet, args.resume_from_checkpoint, accelerator)
+        global_step = resume_model(text_encoder, args.resume_from_checkpoint, accelerator)
+
+    global_step, first_epoch, progress_bar = more_init(accelerator, args, train_dataloader, 
+                                                        train_dataset, logger, num_update_steps_per_epoch, global_step, wandb_name="train_lora")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -126,7 +131,8 @@ def train(args):
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            if args.use_wandb:
+                accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break

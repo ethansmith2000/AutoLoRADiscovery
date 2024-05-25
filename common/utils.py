@@ -29,6 +29,14 @@ def get_num_params(state_dict):
 def convert_to_multi(state_dict, idx=0):
     new_state_dict = {}
     for k,v in state_dict.items():
+
+        # single lora method to multi
+        k = k.replace(".weight", f".{idx}")
+        if k.endswith("lora_weight"):
+            k = k.replace("lora_weight", f"lora_weight.{idx}")
+        if k.endswith("lora_bias"):
+            k = k.replace("lora_bias", f"lora_bias.{idx}")
+
         # changing index 
         k = re.sub(r"lora_down\.(\d+)", f"lora_down.{idx}", k)
         k = re.sub(r"lora_up\.(\d+)", f"lora_up.{idx}", k)
@@ -96,6 +104,7 @@ def batch_slerp(a, b, t):
     if len(t.shape) == 1:
         t = t[..., None]
     dot = (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(dim=-1)[...,None].clamp(-0.999999, 0.999999)
+    # dot = (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(dim=-1)[...,None].clamp(-0.9999, 0.9999)
     omega = torch.acos(dot)
     sin_omega = torch.sin(omega)
     part1 = torch.sin((1.0 - t) * omega) / sin_omega * a
@@ -137,26 +146,52 @@ def rand_merge_layerwise(lora_a, lora_b, weight_dict, slerp=True):
 @torch.no_grad()
 def rand_merge(lora_a, lora_b, slerp=True):
     interp_fn = batch_slerp if slerp else lerp
-    coef = torch.rand(lora_a.shape[0], 1).cuda()
+    coef = torch.rand(lora_a.shape[0], 1).cuda().to(lora_a.dtype)
     # out = batch_slerp(lora_a, lora_b, coef)
     out = interp_fn(lora_a, lora_b, coef)
     return out
 
 
-def augmentations(batch, weight_dict, first=0.9, second=0.35, third=0.01, slerp=True):
-    orig_batch = batch
-    if random.random() < first:
-        batch = rand_merge(orig_batch, batch.flip(0))
-        if random.random() < second:
-            perm = torch.randperm(batch.shape[0])
-            if random.random() < 0.5:
-                batch = rand_merge(batch, batch[perm], slerp)
-            else:
-                batch = rand_merge(batch, orig_batch[perm], slerp)
+def augmentations(batch, weight_dict, 
+                    first=0.85, 
+                    second=0.35,
+                    second_w_orig=0.5,
+                    third=0.1, 
+                    third_w_orig=0.5,
+                    layerwise=0.01,
+                    slerp=True,
+                    null_p=0.001,
+                    ):
+    orig_batch = batch.clone()
+    mask = torch.rand(batch.shape[0]) < first
+    if sum(mask) > 0:
+        batch[mask] = rand_merge(orig_batch[mask], batch.flip(0)[mask])
+
+
+    mask = torch.rand(batch.shape[0]) < second
+    if sum(mask) > 0:
+        perm = torch.randperm(batch.shape[0])
+        if random.random() < second_w_orig:
+            batch[mask] = rand_merge(batch[mask], orig_batch[perm][mask], slerp)
+        else:
+            batch[mask] = rand_merge(batch[mask], batch[perm][mask], slerp)
     
-    # if random.random() < third:
-    #     perm = torch.randperm(batch.shape[0])
-    #     batch = rand_merge_layerwise(batch, batch[perm],weight_dict, slerp)
+    mask = torch.rand(batch.shape[0]) < third
+    if sum(mask) > 0:
+        perm = torch.randperm(batch.shape[0])
+        if random.random() < third_w_orig:
+            batch[mask] = rand_merge(batch[mask], orig_batch[perm][mask], slerp)
+        else:
+            batch[mask] = rand_merge(batch[mask], batch[perm][mask], slerp)
+
+    mask = torch.rand(batch.shape[0]) < layerwise
+    if sum(mask) > 0:
+        perm = torch.randperm(batch.shape[0])
+        batch[mask] = rand_merge_layerwise(batch[mask], orig_batch[perm][mask], weight_dict, slerp)
+
+    mask = torch.rand(batch.shape[0]) < null_p
+    if sum(mask) > 0:
+        batch[mask] = orig_batch[mask]
 
     return batch
 

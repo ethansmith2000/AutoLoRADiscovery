@@ -8,7 +8,8 @@ import math
 import sys
 sys.path.append('..')
 
-from common.models import TimestepEmbedding, AdaNorm, ChunkFanOut, Attention, FeedForward, DiTBlock
+from common.models import TimestepEmbedding, AdaNorm, ChunkFanOut, Attention, FeedForward, DiTBlock, Resnet
+
 
 class Resnet(nn.Module):
 
@@ -16,15 +17,14 @@ class Resnet(nn.Module):
         self,
         in_dim: int,
         mid_dim: int,
+        out_dim: int = None,
         dropout: float = 0.0,
         ada_dim: int = 512,
         act = torch.nn.SiLU,
     ):
         super().__init__()
-        # self.norm1 = nn.LayerNorm(in_dim)
         self.norm1 = AdaNorm(in_dim, ada_dim)
         self.linear1 = nn.Linear(in_dim, mid_dim)
-        # self.norm2 = nn.LayerNorm(mid_dim)
         self.norm2 = AdaNorm(mid_dim, ada_dim)
         self.dropout = torch.nn.Dropout(dropout)
         self.linear2 = nn.Linear(mid_dim, in_dim)
@@ -45,48 +45,52 @@ class Resnet(nn.Module):
         return hidden_states + resid
 
 
+class ResnetBlock(nn.Module):
 
-class Encoder(torch.nn.Module):
-    def __init__(self, data_dim=1_365_504, model_dim=256, ff_mult=3, in_proj_chunks=1, act=torch.nn.SiLU, num_layers=6):
+    def __init__(self, num_layers=3, in_dim=256, mid_dim=256, ada_dim=512):
         super().__init__()
-        self.in_proj = ChunkFanOut(data_dim, model_dim, chunks=in_proj_chunks)
-        self.resnets = nn.ModuleList([Resnet(model_dim, model_dim * ff_mult, act=act, ada_dim=model_dim//2) for _ in range(num_layers)])
-        self.out_proj = nn.Linear(model_dim, model_dim)
+        self.layers = nn.ModuleList([Resnet(in_dim, mid_dim, ada_dim=ada_dim) for _ in range(num_layers)])
 
     def forward(self, x, ada_emb):
-        x = self.in_proj(x)
-        for resnet in self.resnets:
-            x = resnet(x, ada_emb=ada_emb)
-        return self.out_proj(x)
-
-
-class Decoder(torch.nn.Module):
-    def __init__(self, data_dim=1_365_504, model_dim=256, ff_mult=3, out_proj_chunks=1, act=torch.nn.SiLU, num_layers=6):
-        super().__init__()
-        self.in_proj = nn.Linear(model_dim, model_dim)
-        self.resnets = nn.ModuleList([Resnet(model_dim, model_dim * ff_mult, act=act, ada_dim=model_dim//2) for _ in range(num_layers)])
-        self.out_proj = ChunkFanOut(model_dim, data_dim, chunks=out_proj_chunks)
-
-    def forward(self, x, ada_emb):
-        x = self.in_proj(x)
-        for resnet in self.resnets:
-            x = resnet(x, ada_emb=ada_emb)
-        x = self.out_proj(x)
+        for layer in self.layers:
+            x = layer(x, ada_emb)
         return x
 
 
 class LoraDiffusion(torch.nn.Module):
 
-    def __init__(self, data_dim=1_365_504, model_dim=256, ff_mult=3, chunks=1, act=torch.nn.SiLU, encoder_layers=6, decoder_layers=12):
+    def __init__(self, data_dim=1_365_504, 
+                    model_dim=256, 
+                    ff_mult=3, 
+                    chunks=1, 
+                    act=torch.nn.SiLU, 
+                    num_blocks=4, 
+                    layers_per_block=3
+                    ):
         super().__init__()
         self.time_embed = TimestepEmbedding(model_dim//2, model_dim//2)
-        self.encoder = Encoder(data_dim, model_dim, ff_mult, chunks, act, encoder_layers)
-        self.decoder = Decoder(data_dim, model_dim, ff_mult, chunks, act, decoder_layers)
+        self.in_norm = nn.LayerNorm(data_dim)
+        self.in_proj = ChunkFanOut(data_dim, model_dim, chunks=chunks)
+        self.out_norm = nn.LayerNorm(model_dim)
+        self.out_proj = ChunkFanOut(model_dim, data_dim, chunks=chunks)
+
+        self.downs = nn.ModuleList([ResnetBlock(num_layers=layers_per_block, in_dim=model_dim, mid_dim=int(model_dim * ff_mult), ada_dim=model_dim//2) for _ in range(num_blocks)])
+        self.ups = nn.ModuleList([ResnetBlock(num_layers=layers_per_block,  in_dim=model_dim, mid_dim=int(model_dim * ff_mult), ada_dim=model_dim//2) for _ in range(num_blocks)])
+
 
     def forward(self, x, t):
         ada_emb = self.time_embed(t)
-        return self.decoder(self.encoder(x, ada_emb), ada_emb)
-
+        x = self.in_norm(x)
+        x = self.in_proj(x)
+        skips = []
+        for down in self.downs:
+            x = down(x, ada_emb)
+            skips.append(x)
+        for up, skip in zip(self.ups, reversed(skips)):
+            x = up(x, ada_emb) + skip
+        x = self.out_norm(x)
+        x = self.out_proj(x)
+        return x
 
 
 

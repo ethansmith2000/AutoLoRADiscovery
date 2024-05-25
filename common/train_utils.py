@@ -17,6 +17,8 @@ import logging
 import math
 # import common.loras as loras
 # from loras import patch_lora
+import sys
+sys.path.append('..')
 from common.loras import patch_lora
 import random
 from diffusers import DPMSolverMultistepScheduler
@@ -197,18 +199,19 @@ def log_validation(
         images.extend(pipeline(**pipeline_args, generator=generator).images)
 
     for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
-        if tracker.name == "wandb":
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt[i]}") for i, image in enumerate(images)
-                    ]
-                }
-            )
+        if args.use_wandb:
+            phase_name = "test" if is_final_validation else "validation"
+            if tracker.name == "tensorboard":
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+            if tracker.name == "wandb":
+                tracker.log(
+                    {
+                        phase_name: [
+                            wandb.Image(image, caption=f"{i}: {args.validation_prompt[i]}") for i, image in enumerate(images)
+                        ]
+                    }
+                )
 
     del pipeline
     torch.cuda.empty_cache()
@@ -350,7 +353,8 @@ default_arguments = dict(
     revision="main",
     variant=None,
     tokenizer_name=None,
-    instance_data_dir="/home/ubuntu/AutoLoRADiscovery/people/Jeff Bezos",
+    # instance_data_dir="/home/ubuntu/AutoLoRADiscovery/people/Jeff Bezos",
+    instance_data_dir="/home/ubuntu/AutoLoRADiscovery/me",
     num_validation_images=4,
     num_class_images=100,
     output_dir="lora-dreambooth-model",
@@ -407,29 +411,25 @@ default_arguments = dict(
         "11"
     ],
     train_text_encoder=True,
+    use_wandb=True,
 )
 
 
-def resume_model(model, args, accelerator, num_update_steps_per_epoch):
-    accelerator.print(f"Resuming from checkpoint {args.resume_from_checkpoint}")
-    global_step = int(args.resume_from_checkpoint.split("-")[-1])
-    state_dict = torch.load(args.resume_from_checkpoint, map_location="cpu")
+def resume_model(model, path, accelerator):
+    accelerator.print(f"Resuming from checkpoint {path}")
+    global_step = int(path.split("-")[-1])
+    state_dict = torch.load(path, map_location="cpu")
 
-    if not isinstance(model, list):
-        model = [model]
-    for m in model:
-        missing, unexpected = m.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    initial_global_step = global_step
-    first_epoch = global_step // num_update_steps_per_epoch
-
-    return global_step, initial_global_step, first_epoch
+    return global_step
 
 
-def more_init(model, accelerator, args, train_dataloader, train_dataset, logger, num_update_steps_per_epoch, wandb_name="diffusion_lora"):
+def more_init(accelerator, args, train_dataloader, train_dataset, logger, num_update_steps_per_epoch, global_step, wandb_name="diffusion_lora"):
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
-        accelerator.init_trackers(wandb_name, config=tracker_config)
+        if args.use_wandb:
+            accelerator.init_trackers(wandb_name, config=tracker_config)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -446,13 +446,9 @@ def more_init(model, accelerator, args, train_dataloader, train_dataset, logger,
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    global_step = 0
-    first_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    initial_global_step = 0
-    if args.resume_from_checkpoint:
-        global_step, initial_global_step, first_epoch = resume_model(model, args, accelerator, num_update_steps_per_epoch)
+    initial_global_step = global_step
+    first_epoch = global_step // num_update_steps_per_epoch
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),

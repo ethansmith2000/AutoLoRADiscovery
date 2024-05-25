@@ -39,6 +39,7 @@ from common.train_utils import (
     get_dataset,
     save_model,
     more_init,
+    resume_model
 )
 
 
@@ -52,7 +53,7 @@ default_arguments = dict(
     instance_data_dir="/home/ubuntu/AutoLoRADiscovery/me",
     num_validation_images=4,
     num_class_images=100,
-    output_dir="PCLora",
+    output_dir="model-output",
     seed=None,
     resolution=640,
     center_crop=False,
@@ -66,7 +67,7 @@ default_arguments = dict(
     gradient_accumulation_steps=1,
     gradient_checkpointing=False,
     # learning_rate=1.0e-4,
-    learning_rate=15.0e-3,
+    learning_rate=1.0e-2,
     # learning_rate=2.5e-5,
     scale_lr=False,
     lr_scheduler="linear",
@@ -111,6 +112,7 @@ default_arguments = dict(
     bundle_lora_path="/home/ubuntu/AutoLoRADiscovery/lora_bundle.pt",
 
     weight_mode = "global", # ["global", "one", "two"]
+    use_wandb = True,
 )
 
 
@@ -179,8 +181,13 @@ def train(args):
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler
     )
 
-    global_step, first_epoch, progress_bar = more_init([unet, text_encoder], accelerator, args, train_dataloader, 
-                                                    train_dataset, logger, num_update_steps_per_epoch, wandb_name="PC-lora")
+    global_step = 0
+    if args.resume_from_checkpoint:
+        global_step = resume_model(unet, args.resume_from_checkpoint, accelerator)
+        global_step = resume_model(text_encoder, args.resume_from_checkpoint, accelerator)
+
+    global_step, first_epoch, progress_bar = more_init(accelerator, args, train_dataloader, 
+                                                    train_dataset, logger, num_update_steps_per_epoch, global_step, wandb_name="PC-lora")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()

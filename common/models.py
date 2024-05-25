@@ -178,3 +178,35 @@ class ChunkFanOut(torch.nn.Module):
 
     def forward(self, x):
         return torch.cat([proj(x) for proj in self.projs], dim=1)
+
+
+
+class Resnet(nn.Module):
+
+    def __init__(
+        self,
+        in_dim: int,
+        mid_dim: int,
+        dropout: float = 0.0,
+        act = torch.nn.SiLU,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(mid_dim)
+        self.linear1 = nn.Linear(in_dim, mid_dim)
+        self.norm2 = nn.LayerNorm(in_dim)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.linear2 = nn.Linear(mid_dim, in_dim)
+        self.act = act()
+
+
+    def forward(
+        self,
+        hidden_states,
+    ) -> torch.FloatTensor:
+
+        resid = hidden_states
+
+        hidden_states = self.norm1(self.act(self.linear1(hidden_states)))
+        hidden_states = self.norm2(self.act(self.linear2(hidden_states)))
+
+        return hidden_states + resid
