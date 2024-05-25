@@ -14,8 +14,12 @@ All scripts have arguments within the scripts themselves or in the common/train_
 
 Alternatively, you can try the datset I've provided [here](https://huggingface.co/datasets/ethansmith2000/lora_bundle_celeb/tree/main) containing 136 LoRAs trained on celebrities. 
 
+Pretrained models for GAN, Diffusion, and VAE can be found [here](https://huggingface.co/ethansmith2000/auto_lora_discovery)
+
 Once you have obtained all your LoRAs, you should use the provided notebook to aggregate all the LoRAs into a single list and regularize the weights using the singular value decomposition. Save this so you can then point to it with the other training scripts.
 
 From there, a method that does consistently work is in PCLora, where you can train new LoRAs by learning coefficients weighing all of the provided LoRAs.
+
+Additionally, the diffusion method tends to work pretty well.
 
 To get more experimental, you can try the discover_X methods which aim to train hypernetworks to produce LoRAs on the fly.
