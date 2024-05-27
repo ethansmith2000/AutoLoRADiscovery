@@ -20,6 +20,7 @@ import math
 import sys
 sys.path.append('..')
 from common.loras import patch_lora
+from common.utils import make_weight_vector
 import random
 from diffusers import DPMSolverMultistepScheduler
 from diffusers.optimization import get_scheduler
@@ -36,6 +37,54 @@ from diffusers import (
 )
 import copy
 from tqdm import tqdm
+
+import numpy as np
+from scipy.stats import johnsonsu, norm
+
+class DummyDataset(Dataset):
+    
+        def __init__(self, data_dim):
+            self.data_dim = data_dim
+    
+        def __len__(self):
+            return 1000
+    
+        def __getitem__(self, index):
+            return torch.randn(self.data_dim)
+
+
+def dist(num_samples=10_000, mean=0, std=1, kurtosis=3, skewness=0.0):
+    johnson_su = johnsonsu.fit(np.random.normal(size=num_samples), fa=skewness, fb=np.sqrt(kurtosis))
+    samples = johnsonsu.rvs(*johnson_su, size=num_samples)
+    scaled_samples = std * (samples - np.mean(samples)) / np.std(samples) + mean
+
+    return scaled_samples
+
+def get_a_lora(lora_bundle, std=0.1, kurtosis=3.35):
+    weights = dist(num_samples=lora_bundle.shape[0], mean=0, std=std, kurtosis=kurtosis, skewness=0.0)
+    weights = torch.tensor(weights).to(lora_bundle.device).to(lora_bundle.dtype)
+    weights = weights - weights.mean()
+    a_lora = torch.sum(weights[:,None] * lora_bundle, dim=0)
+    return a_lora
+
+class LoraDataset(Dataset):
+
+    def __init__(
+        self,
+        lora_bundle_path,
+        num_dataloader_repeats=20, # this could blow up memory be careful!
+    ):
+        self.lora_bundle = torch.load(lora_bundle_path)
+        self.lora_bundle = [make_weight_vector(state_dict) for state_dict in self.lora_bundle]
+        self.weight_dict = self.lora_bundle[0][1]
+        self.lora_bundle = [x[0] for x in self.lora_bundle] * num_dataloader_repeats
+        random.shuffle(self.lora_bundle)
+
+    def __len__(self):
+        return len(self.lora_bundle)
+
+    def __getitem__(self, index):
+        return self.lora_bundle[index]
 
 
 def collate_fn(examples):

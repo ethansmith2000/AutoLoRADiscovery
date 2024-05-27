@@ -19,7 +19,9 @@ from common.train_utils import (
     unwrap_model,
     get_optimizer,
     more_init,
-    resume_model
+    resume_model,
+    get_a_lora,
+    DummyDataset
 )
 
 from types import SimpleNamespace
@@ -27,48 +29,6 @@ from discover_lora_vae.models import LoraVAE
 from torch.utils.data import Dataset
 import random
 
-import numpy as np
-from scipy.stats import johnsonsu, norm
-
-
-def dist(num_samples=10_000, mean=0, std=1, kurtosis=3, skewness=0.0):
-    johnson_su = johnsonsu.fit(np.random.normal(size=num_samples), fa=skewness, fb=np.sqrt(kurtosis))
-    samples = johnsonsu.rvs(*johnson_su, size=num_samples)
-    scaled_samples = std * (samples - np.mean(samples)) / np.std(samples) + mean
-
-    return scaled_samples
-
-class LoraDataset(Dataset):
-
-    def __init__(
-        self,
-        lora_bundle_path,
-        num_dataloader_repeats=20, # this could blow up memory be careful!
-    ):
-        self.lora_bundle = torch.load(lora_bundle_path)
-        self.lora_bundle = [make_weight_vector(state_dict) for state_dict in self.lora_bundle]
-        self.weight_dict = self.lora_bundle[0][1]
-        self.lora_bundle = [x[0] for x in self.lora_bundle] * num_dataloader_repeats
-        random.shuffle(self.lora_bundle)
-
-    def __len__(self):
-        return len(self.lora_bundle)
-
-    def __getitem__(self, index):
-        return self.lora_bundle[index]
-
-
-
-class DummyDataset(Dataset):
-    
-        def __init__(self, data_dim):
-            self.data_dim = data_dim
-    
-        def __len__(self):
-            return 1000
-    
-        def __getitem__(self, index):
-            return torch.randn(self.data_dim)
 
 
 def collate_fn(examples):
@@ -154,15 +114,9 @@ def train(args):
 
     lora_bundle = torch.load(args.data_dir)
     lora_bundle = [make_weight_vector(state_dict) for state_dict in lora_bundle]
+    weight_dict = lora_bundle[0][1]
     lora_bundle = [x[0] for x in lora_bundle]
     lora_bundle = torch.stack(lora_bundle).cuda().to(torch.bfloat16) / args.lora_std
-
-    def get_a_lora(std=0.1, kurtosis=3.35):
-        weights = dist(num_samples=lora_bundle.shape[0], mean=0, std=std, kurtosis=kurtosis, skewness=0.0)
-        weights = torch.tensor(weights).to(lora_bundle.device).to(lora_bundle.dtype)
-        weights = weights - weights.mean()
-        a_lora = torch.sum(weights[:,None] * lora_bundle, dim=0)
-        return a_lora
 
     # Prepare everything with our `accelerator`.
     lora_vae, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -179,22 +133,19 @@ def train(args):
 
     def train_step(first=0.4, first_with_orig=0.01, second=0.4, second_w_orig=0.01, noise_std=0.01):
         # generate random loras by mixing full dataset
-        batch = [get_a_lora() for _ in range(args.train_batch_size)]
-        batch = torch.stack(batch).to(torch.bfloat16)
+        batch = [get_a_lora(lora_bundle) for _ in range(args.train_batch_size)]
+        batch = torch.stack(batch).float()
 
         orig_indices = torch.randperm(lora_bundle.shape[0])[:args.train_batch_size]
-        orig_batch = lora_bundle[orig_indices]
-
-        orig_batch = orig_batch.float()
-        batch = batch.float()
+        orig_batch = lora_bundle[orig_indices].float()
 
         mask = torch.rand(batch.shape[0]) < first
         if sum(mask) > 0:
             perm = torch.randperm(batch.shape[0])
             if random.random() < first_with_orig:
-                batch[mask] = rand_merge(batch[mask], orig_batch[perm][mask])
+                batch[mask] = rand_merge(batch[mask], orig_batch[perm][mask], slerp=True)
             else:
-                batch[mask] = rand_merge(batch[mask], batch[perm][mask])
+                batch[mask] = rand_merge(batch[mask], batch[perm][mask], slerp=True)
 
 
         mask = torch.rand(batch.shape[0]) < second
@@ -206,7 +157,6 @@ def train(args):
                 batch[mask] = rand_merge(batch[mask], batch[perm][mask], slerp=True)
 
         # add noise
-        # noise_factors = torch.rand(batch.shape[0], 1).to(batch.device) * (noise_std / args.lora_std)
         noise_factors = torch.rand(batch.shape[0], 1).to(batch.device) * noise_std
         batch = batch + torch.randn_like(batch) * noise_factors
 

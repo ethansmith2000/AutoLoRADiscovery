@@ -11,7 +11,7 @@ import sys
 sys.path.append('..')
 
 from common.loras import patch_lora
-from common.utils import make_weight_vector, augmentations
+from common.utils import make_weight_vector, augmentations, rand_merge_layerwise, rand_merge
 from common.train_utils import (
     init_train_basics,
     log_validation,
@@ -19,7 +19,9 @@ from common.train_utils import (
     unwrap_model,
     get_optimizer,
     more_init,
-    resume_model
+    resume_model,
+    DummyDataset,
+    get_a_lora,
 )
 
 from types import SimpleNamespace
@@ -28,32 +30,13 @@ from torch.utils.data import Dataset
 import random
 import diffusers
 
-class LoraDataset(Dataset):
-
-    def __init__(
-        self,
-        lora_bundle_path,
-        num_dataloader_repeats=10, # this could blow up memory be careful!
-    ):
-        self.lora_bundle = torch.load(lora_bundle_path)
-        self.lora_bundle = [make_weight_vector(state_dict) for state_dict in self.lora_bundle]
-        self.weight_dict = self.lora_bundle[0][1]
-        self.lora_bundle = [x[0] for x in self.lora_bundle] * num_dataloader_repeats
-        random.shuffle(self.lora_bundle)
-
-    def __len__(self):
-        return len(self.lora_bundle)
-
-    def __getitem__(self, index):
-        return self.lora_bundle[index]
-
 
 def collate_fn(examples):
     return torch.stack(examples)
 
 
 def get_dataset(args):
-    train_dataset = LoraDataset(args.data_dir)
+    train_dataset = DummyDataset(1000)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -118,10 +101,10 @@ default_arguments = dict(
     seed=None,
     train_batch_size=64,
     max_train_steps=80_000,
-    # validation_steps=250,
     num_dataloader_repeats=100,
     checkpointing_steps=2000,
-    resume_from_checkpoint="/home/ubuntu/AutoLoRADiscovery/discover_lora_diffusion/diffusion_lora/checkpoint-76000",
+    # resume_from_checkpoint="/home/ubuntu/AutoLoRADiscovery/discover_lora_diffusion/diffusion_lora/checkpoint-76000",
+    resume_from_checkpoint=None,
     gradient_accumulation_steps=1,
     gradient_checkpointing=False,
     learning_rate=1.0e-4,
@@ -164,23 +147,19 @@ def train(args):
         layers_per_block=3
     )
 
-    # lora_diffusion = DiT(
-    #     total_dim=1_365_504,
-    #     dim = 1536,
-    #     num_tokens=889,
-    #     time_dim = 384,
-    #     depth=12,
-    #     num_heads=16,
-    #     mlp_ratio=4.0,
-    # )
-
     scheduler = diffusers.UnCLIPScheduler.from_config("kandinsky-community/kandinsky-2-2-prior", subfolder="scheduler")
 
     params_to_optimize = list(lora_diffusion.parameters())
     train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args)
+    # weight_dict = train_dataset.weight_dict
     optimizer, lr_scheduler = get_optimizer(args, params_to_optimize, accelerator)
 
-    weight_dict = train_dataset.weight_dict
+    lora_bundle = torch.load(args.data_dir)
+    lora_bundle = [make_weight_vector(state_dict) for state_dict in lora_bundle]
+    weight_dict = lora_bundle[0][1]
+    lora_bundle = [x[0] for x in lora_bundle]
+    lora_bundle = torch.stack(lora_bundle).cuda().to(torch.bfloat16) / args.lora_std
+
 
     # Prepare everything with our `accelerator`.
     lora_diffusion, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -197,33 +176,68 @@ def train(args):
                                                         global_step, wandb_name="diffusion_lora")
 
 
+    def train_step(first=0.4, first_with_orig=0.01, second=0.4, second_w_orig=0.01, layerwise=0.01, layerwise_w_orig=0.5, noise_std=0.01):
+        # generate random loras by mixing full dataset
+        batch = [get_a_lora(lora_bundle) for _ in range(args.train_batch_size)]
+        batch = torch.stack(batch).float()
+
+        orig_indices = torch.randperm(lora_bundle.shape[0])[:args.train_batch_size]
+        orig_batch = lora_bundle[orig_indices].float()
+
+        mask = torch.rand(batch.shape[0]) < first
+        if sum(mask) > 0:
+            perm = torch.randperm(batch.shape[0])
+            if random.random() < first_with_orig:
+                batch[mask] = rand_merge(batch[mask], orig_batch[perm][mask], slerp=True)
+            else:
+                batch[mask] = rand_merge(batch[mask], batch[perm][mask], slerp=True)
+
+
+        mask = torch.rand(batch.shape[0]) < second
+        if sum(mask) > 0:
+            perm = torch.randperm(batch.shape[0])
+            if random.random() < second_w_orig:
+                batch[mask] = rand_merge(batch[mask], orig_batch[perm][mask], slerp=True)
+            else:
+                batch[mask] = rand_merge(batch[mask], batch[perm][mask], slerp=True)
+
+        mask = torch.rand(batch.shape[0]) < layerwise
+        if sum(mask) > 0:
+            perm = torch.randperm(batch.shape[0])
+            if random.random() < layerwise_w_orig:
+                batch[mask] = rand_merge_layerwise(batch[mask], orig_batch[perm][mask], weight_dict, slerp=True)
+            else:
+                batch[mask] = rand_merge_layerwise(batch[mask], batch[perm][mask], weight_dict, slerp=True)
+
+        # add noise augmentation
+        noise_factors = torch.rand(batch.shape[0], 1).to(batch.device) * noise_std
+        batch = batch + torch.randn_like(batch) * noise_factors
+
+        # add actual noise for diffusion
+        noise = torch.randn_like(batch)
+        timesteps = torch.randint(
+            0, scheduler.config.num_train_timesteps, (batch.shape[0],), device=batch.device
+        ).long()
+        noisy_model_input = scheduler.add_noise(batch, noise, timesteps)
+
+        pred = lora_diffusion(noisy_model_input, timesteps)
+        loss = F.mse_loss(pred, batch, reduction="mean")
+
+        accelerator.backward(loss)
+        if accelerator.sync_gradients:
+            grad_norm = accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        return loss, grad_norm
+
+
     for epoch in range(first_epoch, args.num_train_epochs):
         lora_diffusion.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_diffusion):
-                batch = batch.to(accelerator.device) * (1 / args.lora_std)
-                batch = augmentations(batch, weight_dict, first=0.95, second=0.65, second_w_orig=0.5, 
-                                                        third=0.45, third_w_orig=0.5, 
-                                                        layerwise=0.0, 
-                                                        null_p=0.001)
-
-                noise = torch.randn_like(batch)
-                timesteps = torch.randint(
-                    0, scheduler.config.num_train_timesteps, (batch.shape[0],), device=batch.device
-                ).long()
-
-                noisy_model_input = scheduler.add_noise(batch, noise, timesteps)
-
-                pred = lora_diffusion(noisy_model_input, timesteps)
-                loss = F.mse_loss(pred, batch, reduction="mean")
-                # loss = get_loss(pred, noise, timesteps, scheduler, snr_gamma=args.snr_gamma)
-
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                loss, grad_norm = train_step()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
