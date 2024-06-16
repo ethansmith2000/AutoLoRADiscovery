@@ -7,3 +7,4 @@ lora_bundle.pt
 checkpoint*
 *.pt*
 me
+*__pycache__*
